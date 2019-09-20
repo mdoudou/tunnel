@@ -9,8 +9,10 @@ require (
 	github.com/cosiner/process v0.0.2
 	github.com/ghodss/yaml v1.0.0
 	github.com/ginuerzh/gosocks5 v0.2.0
+	github.com/klauspost/compress v1.8.4
 	github.com/klauspost/cpuid v1.2.1 // indirect
 	github.com/klauspost/reedsolomon v1.9.2 // indirect
+	github.com/lucas-clemente/quic-go v0.12.0
 	github.com/oschwald/geoip2-golang v1.3.0
 	github.com/oschwald/maxminddb-golang v1.5.0 // indirect
 	github.com/pkg/errors v0.8.1 // indirect

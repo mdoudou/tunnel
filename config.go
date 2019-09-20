@@ -1,6 +1,7 @@
 package main
 
 type ServerConfig struct {
+	Compress string
 	Transfer string
 	Listen   string
 	Key      string

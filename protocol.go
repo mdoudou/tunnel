@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 )
 
 type HandshakeRequest struct {
@@ -36,7 +35,7 @@ func varintSize(u uint64) int {
 	return c
 }
 
-func ProtocolWrite(conn net.Conn, v interface{}) error {
+func ProtocolWrite(conn io.ReadWriteCloser, v interface{}) error {
 	var buf bytes.Buffer
 	err := json.NewEncoder(&buf).Encode(v)
 	if err != nil {

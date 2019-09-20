@@ -3,7 +3,13 @@ package main
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"compress/gzip"
+	"crypto/md5"
+	"crypto/rsa"
+	"crypto/sha512"
+	"crypto/x509"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -16,6 +22,10 @@ import (
 	"time"
 
 	"github.com/cosiner/golog"
+	"github.com/klauspost/compress/s2"
+	"github.com/klauspost/compress/snappy"
+	"github.com/klauspost/compress/zlib"
+	"github.com/lucas-clemente/quic-go"
 	"github.com/xtaci/smux"
 )
 
@@ -31,10 +41,30 @@ func (c *closeOnceConn) Close() error {
 	return nil
 }
 
+type closeOnceServerConn struct {
+	closed uint32
+	MultiplexingServerConn
+}
+
+func (c *closeOnceServerConn) Close() error {
+	if atomic.CompareAndSwapUint32(&c.closed, 0, 1) {
+		return c.MultiplexingServerConn.Close()
+	}
+	return nil
+}
+
 func smuxConfig() *smux.Config {
 	config := smux.DefaultConfig()
 	config.KeepAliveTimeout = time.Minute * 5
 	return config
+}
+
+func quicConfig() *quic.Config {
+	return &quic.Config{
+		//HandshakeTimeout: time.Second * 3,
+		IdleTimeout: time.Minute * 5,
+		KeepAlive:   true,
+	}
 }
 
 type buffedConn struct {
@@ -182,4 +212,412 @@ OUTER:
 	}
 	fd.Close()
 	return path, nil
+}
+
+type proxyConn struct {
+	net.Conn
+	rf func(io.Reader) (io.Reader, error)
+	wf func(io.Writer) io.Writer
+	mu sync.RWMutex
+
+	r io.Reader
+	w io.Writer
+}
+
+func (c *proxyConn) createReader() (io.Reader, error) {
+	var (
+		r   io.Reader
+		err error
+	)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.r == nil {
+		c.r, err = c.rf(c.Conn)
+	}
+	r = c.r
+	return r, err
+}
+func (c *proxyConn) createWriter() io.Writer {
+	var (
+		w io.Writer
+	)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.w == nil {
+		c.w = c.wf(c.Conn)
+	}
+	w = c.w
+	return w
+}
+
+func (c *proxyConn) Read(b []byte) (int, error) {
+	c.mu.RLock()
+	r := c.r
+	c.mu.RUnlock()
+	if r == nil {
+		var err error
+		r, err = c.createReader()
+		if err != nil {
+			return 0, err
+		}
+	}
+	n, err := r.Read(b)
+	return n, err
+}
+
+func (c *proxyConn) Write(b []byte) (int, error) {
+	c.mu.RLock()
+	w := c.w
+	c.mu.RUnlock()
+	if w == nil {
+		w = c.createWriter()
+	}
+
+	n, err := w.Write(b)
+	if err != nil {
+		return 0, err
+	}
+	f, ok := w.(interface {
+		Flush() error
+	})
+	if ok {
+		err = f.Flush()
+		if err != nil {
+			return 0, err
+		}
+	}
+	return n, nil
+}
+
+func newCompressConn(conn net.Conn, algorithm string) (net.Conn, error) {
+	switch algorithm {
+	case "disable":
+		return conn, nil
+	default:
+		fallthrough
+	case "zlib":
+		return &proxyConn{
+			Conn: conn,
+			rf:   func(r io.Reader) (io.Reader, error) { return zlib.NewReader(r) },
+			wf:   func(w io.Writer) io.Writer { return zlib.NewWriter(w) },
+		}, nil
+	case "gzip":
+		return &proxyConn{
+			Conn: conn,
+			rf:   func(r io.Reader) (io.Reader, error) { return gzip.NewReader(r) },
+			wf:   func(w io.Writer) io.Writer { return gzip.NewWriter(w) },
+		}, nil
+	case "s2":
+		return &proxyConn{
+			Conn: conn,
+			rf:   func(r io.Reader) (io.Reader, error) { return s2.NewReader(r), nil },
+			wf:   func(w io.Writer) io.Writer { return s2.NewWriter(w) },
+		}, nil
+	case "snappy":
+		return &proxyConn{
+			Conn: conn,
+			rf:   func(r io.Reader) (io.Reader, error) { return snappy.NewReader(r), nil },
+			wf:   func(w io.Writer) io.Writer { return snappy.NewBufferedWriter(w) },
+		}, nil
+	}
+}
+
+func parseTransfer(t string) (string, map[string]string) {
+	idx := strings.Index(t, ":")
+	if idx < 0 {
+		return t, nil
+	}
+	secs := strings.Split(t[idx+1:], ",")
+	t = t[:idx]
+	options := make(map[string]string)
+	for _, s := range secs {
+		kvs := strings.SplitN(s, "=", 2)
+		var k string
+		var v string
+		if len(kvs) > 0 {
+			k = kvs[0]
+		}
+		if len(kvs) > 1 {
+			v = kvs[1]
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(k)
+		if k != "" && v != "" {
+			options[k] = v
+		}
+	}
+	return t, options
+}
+
+type keyReader struct {
+	s   []byte
+	l   int
+	idx int
+}
+
+func newKeyReader(k string) *keyReader {
+	var buf bytes.Buffer
+	data := []byte(k)
+	for i := 0; i < 512; i++ {
+		h := sha512.New()
+		h.Write(data)
+		data = h.Sum(nil)
+		buf.Write(data)
+	}
+
+	return &keyReader{
+		s: buf.Bytes(),
+		l: buf.Len(),
+	}
+}
+
+func (k *keyReader) Reset() {
+	k.idx = 0
+}
+
+func (k *keyReader) Read(b []byte) (int, error) {
+	if k.l <= 0 {
+		return 0, io.EOF
+	}
+	l := len(b)
+	var n int
+	for {
+		c := copy(b[n:], k.s[k.idx:])
+		n += c
+		k.idx += n
+		if k.idx >= k.l {
+			k.idx = 0
+		}
+		if n >= l {
+			break
+		}
+	}
+	return n, nil
+}
+
+func generateCAKey(keyStr string, bits int) (string, *rsa.PrivateKey, error) {
+	r := newKeyReader(keyStr)
+	keys := make(map[string]*rsa.PrivateKey)
+	const NPrimes = 2
+
+	var c int
+	if NPrimes%2 == 0 {
+		c = 2
+	} else {
+		c = 1
+	}
+	for len(keys) < c {
+		r.Reset()
+		priv, err := rsa.GenerateMultiPrimeKey(r, NPrimes, bits)
+		if err != nil {
+			return "", nil, err
+		}
+		data := x509.MarshalPKCS1PrivateKey(priv)
+		{
+			m := md5.New()
+			m.Write(data)
+			data = m.Sum(nil)
+		}
+		key := hex.EncodeToString(data)
+		_, has := keys[key]
+		if has {
+			continue
+		}
+		keys[key] = priv
+	}
+
+	var (
+		key  string
+		priv *rsa.PrivateKey
+	)
+	for k, p := range keys {
+		if key == "" || k < key {
+			key = k
+			priv = p
+		}
+	}
+	return key, priv, nil
+}
+
+func listenUDPAndWrap(addr string, isServer bool, w *MaskConnWrapper) (net.PacketConn, net.Addr, error) {
+	udpaddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve udp addr failed: %w", err)
+	}
+	network := "udp4"
+	if udpaddr.IP.To4() == nil {
+		network = "udp"
+	}
+	listenAddr := udpaddr
+	if !isServer {
+		listenAddr = nil
+	}
+	c, err := net.ListenUDP(network, listenAddr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listen udp failed: %w", err)
+	}
+	if w == nil {
+		return c, nil, nil
+	}
+	return w.WrapPacketConn(c), udpaddr, nil
+}
+
+type MaskConnWrapper struct {
+	Masker
+}
+
+func NewMaskConnWrapper(key string) *MaskConnWrapper {
+	h := md5.New()
+	h.Write([]byte(key))
+	d := h.Sum(nil)
+
+	xor := NewXorMasker(d)
+	maskers := Maskers{
+		xor,
+		ReverseMasker{},
+		NewDictMasker(d),
+	}
+	return &MaskConnWrapper{
+		Masker: maskers,
+	}
+}
+
+func (m *MaskConnWrapper) WrapConn(conn net.Conn) net.Conn {
+	return &MaskConn{
+		m:    m.Masker,
+		Conn: conn,
+	}
+}
+
+func (m *MaskConnWrapper) WrapPacketConn(conn net.PacketConn) net.PacketConn {
+	return &MaskPacketConn{
+		m:          m.Masker,
+		PacketConn: conn,
+	}
+}
+
+type Masker interface {
+	Mask(b []byte)
+	Unmask(b []byte)
+}
+
+type Maskers []Masker
+
+func (m Maskers) Mask(b []byte) {
+	for i := range m {
+		m[i].Mask(b)
+	}
+}
+
+func (m Maskers) Unmask(b []byte) {
+	for i := len(m) - 1; i >= 0; i-- {
+		m[i].Unmask(b)
+	}
+}
+
+func NewXorMasker(key []byte) XorMasker {
+	var m byte
+	for _, b := range key {
+		m ^= b
+	}
+	return XorMasker(m)
+}
+
+type XorMasker byte
+
+func (m XorMasker) Mask(b []byte) {
+	for i := range b {
+		b[i] ^= byte(m)
+	}
+}
+
+func (m XorMasker) Unmask(b []byte) {
+	m.Mask(b)
+}
+
+type ReverseMasker struct{}
+
+func (m ReverseMasker) Mask(b []byte) {
+	for i := range b {
+		b[i] = 255 - b[i]
+	}
+}
+
+func (m ReverseMasker) Unmask(b []byte) {
+	m.Mask(b)
+}
+
+type DictMasker struct {
+	dict        [256]byte
+	dictRestore [256]byte
+}
+
+func NewDictMasker(key []byte) *DictMasker {
+	var m DictMasker
+	for i := range m.dict {
+		m.dict[i] = byte(i)
+	}
+	r := keyReader{s: key, l: len(key)}
+
+	var buf [1]byte
+	for i := range m.dict {
+		_, _ = r.Read(buf[:])
+		j := byte(i) ^ buf[0]
+
+		m.dict[i], m.dict[j] = m.dict[j], m.dict[i]
+	}
+	for i := range m.dict {
+		m.dictRestore[m.dict[i]] = byte(i)
+	}
+	return &m
+}
+
+func (m *DictMasker) Mask(b []byte) {
+	for i := range b {
+		b[i] = m.dict[b[i]]
+	}
+}
+
+func (m *DictMasker) Unmask(b []byte) {
+	for i := range b {
+		b[i] = m.dictRestore[b[i]]
+	}
+}
+
+type MaskConn struct {
+	net.Conn
+
+	m Masker
+}
+
+func (m *MaskConn) Read(b []byte) (int, error) {
+	n, err := m.Conn.Read(b)
+	m.m.Unmask(b[:n])
+	return n, err
+}
+
+func (m *MaskConn) Write(b []byte) (int, error) {
+	m.m.Mask(b)
+	n, err := m.Conn.Write(b)
+	m.m.Unmask(b[n:])
+	return n, err
+}
+
+type MaskPacketConn struct {
+	net.PacketConn
+
+	m Masker
+}
+
+func (m *MaskPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, addr, err := m.PacketConn.ReadFrom(b)
+	m.m.Unmask(b[:n])
+	return n, addr, err
+}
+
+func (m *MaskPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	m.m.Mask(b)
+	n, err := m.PacketConn.WriteTo(b, addr)
+	m.m.Unmask(b[n:])
+	return n, err
 }

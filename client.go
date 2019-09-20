@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"regexp"
 	"sync"
@@ -14,7 +15,6 @@ import (
 	"github.com/cosiner/golog"
 	"github.com/ginuerzh/gosocks5"
 	"github.com/oschwald/geoip2-golang"
-	"github.com/xtaci/smux"
 )
 
 type proxyRule struct {
@@ -31,10 +31,9 @@ type Client struct {
 	closed         uint32
 	clientListener net.Listener
 
-	serverTransfer      Transfer
-	serverConnMu        sync.RWMutex
-	serverConnFailTimes uint
-	serverConn          *smux.Session
+	serverTransfer Transfer
+	serverConnMu   sync.RWMutex
+	serverConns    map[MultiplexingClientConn]int
 
 	clientConnWg sync.WaitGroup
 	clientConnMu sync.RWMutex
@@ -46,17 +45,19 @@ func NewClient(config ClientConfig) (*Client, error) {
 		config:       config,
 		clientConnWg: sync.WaitGroup{},
 		clientConns:  make(map[net.Conn]struct{}),
+		serverConns:  make(map[MultiplexingClientConn]int),
 	}
 	var err error
 	c.clientListener, err = net.Listen("tcp", c.config.Listen)
 	if err != nil {
 		return nil, fmt.Errorf("create listener failed: %w", err)
 	}
-	tc, ok := transfers[config.Server.Transfer]
+	transfer, options := parseTransfer(config.Server.Transfer)
+	tc, ok := transfers[transfer]
 	if !ok {
 		return nil, fmt.Errorf("unsupported transfer protcol: %s", config.Server.Transfer)
 	}
-	c.serverTransfer, err = tc(c.config.Server.Key)
+	c.serverTransfer, err = tc(c.config.Server.Key, options, NewMaskConnWrapper(c.config.Server.Key))
 	if err != nil {
 		return nil, fmt.Errorf("create transfer failed: %w", err)
 	}
@@ -104,15 +105,15 @@ func (c *Client) closeAllClientConns() {
 		c.Close()
 	}
 }
-func (c *Client) closeServerConn() {
+func (c *Client) closeServerConns() {
 	c.serverConnMu.Lock()
 	defer c.serverConnMu.Unlock()
 
-	if c.serverConn != nil {
-		c.serverConn.Close()
-		c.serverConn = nil
+	for c := range c.serverConns {
+		c.Close()
 	}
 }
+
 func (c *Client) Close() {
 	if !atomic.CompareAndSwapUint32(&c.closed, 0, 1) {
 		return
@@ -120,7 +121,7 @@ func (c *Client) Close() {
 
 	c.clientListener.Close()
 	c.closeAllClientConns()
-	c.closeServerConn()
+	c.closeServerConns()
 
 	c.clientConnWg.Wait()
 }
@@ -159,60 +160,112 @@ func (c *Client) Run() {
 	}
 }
 
-func (c *Client) getServerConn() (*smux.Session, error) {
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
+
+func (c *Client) getServerConn() (MultiplexingClientConn, error) {
 	c.serverConnMu.Lock()
 	defer c.serverConnMu.Unlock()
-	if c.serverConn != nil {
-		if c.serverConn.IsClosed() {
-			c.serverConn = nil
+
+	var curr []MultiplexingClientConn
+	for c := range c.serverConns {
+		if len(curr) == 0 || c.NumStreams() < curr[0].NumStreams() {
+			curr = []MultiplexingClientConn{c}
+		} else if c.NumStreams() == curr[0].NumStreams() {
+			curr = append(curr, c)
+		}
+	}
+	const KEEP_SERVER_CONN = 4
+	if len(c.serverConns) < KEEP_SERVER_CONN {
+		conn, err := c.serverTransfer.Dial(c.config.Server.Listen)
+		if err != nil {
+			if len(curr) == 0 {
+				return nil, fmt.Errorf("dial server failed: %w", err)
+			}
+			golog.WithFields("erorr", err.Error()).Error("create new server connection failed")
 		} else {
-			return c.serverConn, nil
+			c.serverConns[conn] = 0
+			curr = []MultiplexingClientConn{conn}
 		}
 	}
-
-	conn, err := c.serverTransfer.Dial(c.config.Server.Listen)
-	if err != nil {
-		return nil, fmt.Errorf("dial server failed: %w", err)
+	if len(curr) > 0 {
+		return curr[rand.Intn(len(curr))], nil
 	}
-
-	smuxConn, err := smux.Client(conn, smuxConfig())
-	if err != nil {
-		golog.WithFields("error", err.Error()).Error("create smux conn failed")
-		conn.Close()
-		return nil, fmt.Errorf("conn multiplexing failed: %w", err)
-	}
-
-	c.serverConn = smuxConn
-	return c.serverConn, nil
+	return nil, fmt.Errorf("no conn available")
 }
 
-func (c *Client) incrServerConnFailTimes() {
+func (c *Client) incrServerConnFailTimes(conn MultiplexingClientConn) {
 	c.serverConnMu.Lock()
 	defer c.serverConnMu.Unlock()
-	c.serverConnFailTimes++
-	if c.serverConnFailTimes >= 8 {
-		if c.serverConn != nil {
-			c.serverConn.Close()
-			c.serverConn = nil
+
+	const MAX_FAIL = 4
+	times, has := c.serverConns[conn]
+	if has {
+		times++
+		if times >= MAX_FAIL {
+			delete(c.serverConns, conn)
+			return
 		}
-		c.serverConnFailTimes = 0
+
+		c.serverConns[conn] = times
 	}
 }
 
-func (c *Client) openServerStream() (*smux.Stream, error) {
-	conn, err := c.getServerConn()
-	if err != nil {
-		return nil, err
+func (c *Client) clearServerConnFailTimes(conn MultiplexingClientConn) {
+	c.serverConnMu.Lock()
+	defer c.serverConnMu.Unlock()
+	_, has := c.serverConns[conn]
+	if has {
+		c.serverConns[conn] = 0
 	}
-	stream, err := conn.OpenStream()
-	if err != nil {
-		c.incrServerConnFailTimes()
-		return nil, fmt.Errorf("open conn stream failed: %w", err)
-	}
-	return stream, nil
 }
 
-func (c *Client) createServerProxyConn(addr string) (net.Conn, error) {
+type clientProxyConn struct {
+	net.Conn
+
+	sconn MultiplexingClientConn
+	c     *Client
+}
+
+func (c *clientProxyConn) Close() error {
+	err := c.Conn.Close()
+	if !c.c.isServerConnAlive(c.sconn) && c.sconn.NumStreams() <= 0 {
+		c.sconn.Close()
+	}
+	return err
+}
+
+func (c *Client) isServerConnAlive(conn MultiplexingClientConn) bool {
+	c.serverConnMu.RLock()
+	_, has := c.serverConns[conn]
+	c.serverConnMu.RUnlock()
+	return has
+}
+
+func (c *Client) openServerStream() (net.Conn, error) {
+	for i := 0; i < 3; i++ {
+		conn, err := c.getServerConn()
+		if err != nil {
+			return nil, err
+		}
+		stream, err := conn.OpenStream()
+		if err != nil {
+			c.incrServerConnFailTimes(conn)
+			golog.WithFields("error", err.Error()).Error("open server stream failed")
+			continue
+		}
+		c.clearServerConnFailTimes(conn)
+		return &clientProxyConn{
+			Conn:  stream,
+			sconn: conn,
+			c:     c,
+		}, nil
+	}
+	return nil, fmt.Errorf("no conn available")
+}
+
+func (c *Client) createServerProxyStream(addr string) (net.Conn, error) {
 	var (
 		conn net.Conn
 		err  error
@@ -240,7 +293,14 @@ func (c *Client) createServerProxyConn(addr string) (net.Conn, error) {
 	default:
 		return nil, fmt.Errorf("server proxy addr failed: %s", handshakeResp.Msg)
 	}
-
+	{
+		cConn, err := newCompressConn(conn, c.config.Server.Compress)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("create compress conn failed: %w", err)
+		}
+		conn = cConn
+	}
 	return conn, nil
 }
 
@@ -299,7 +359,7 @@ func (c *Client) resolveAddrIps(addr *gosocks5.Addr) ([]net.IP, error) {
 			return nil, fmt.Errorf("invalid ip address: %s", addr.Host)
 		}
 	default:
-		return nil, fmt.Errorf("unsupported addr type: %s", addr.Type)
+		return nil, fmt.Errorf("unsupported addr type: %d", addr.Type)
 	}
 	return ips, nil
 }
@@ -373,7 +433,7 @@ func (c *Client) handleConn(clientConn net.Conn) {
 	var proxyConn net.Conn
 	if proxy {
 		golog.WithFields("addr", req.Addr.String()).Debug("start proxy")
-		proxyConn, err = c.createServerProxyConn(req.Addr.String())
+		proxyConn, err = c.createServerProxyStream(req.Addr.String())
 		if err != nil {
 			golog.WithFields("error", err).Error("create server proxy conn failed")
 			return

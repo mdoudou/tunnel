@@ -10,38 +10,37 @@ import (
 	"time"
 
 	"github.com/cosiner/golog"
-	//"github.com/xtaci/kcp-go"
-	"github.com/xtaci/smux"
 )
 
 type Server struct {
 	config ServerConfig
-	l      net.Listener
+	l      MultiplexingListener
 
 	closed uint32
 	connWg sync.WaitGroup
 	connMu sync.RWMutex
-	conns  map[net.Conn]struct{}
+	conns  map[MultiplexingServerConn]struct{}
 }
 
 func NewServer(config ServerConfig) (*Server, error) {
 	s := Server{
 		config: config,
-		conns:  make(map[net.Conn]struct{}),
+		conns:  make(map[MultiplexingServerConn]struct{}),
 	}
 	var err error
 
-	tc, ok := transfers[config.Transfer]
+	transferType, options := parseTransfer(s.config.Transfer)
+	tc, ok := transfers[transferType]
 	if !ok {
-		return nil, fmt.Errorf("unsupported transfer protcol: %s", config.Transfer)
+		return nil, fmt.Errorf("unsupported transfer protcol: %s", s.config.Transfer)
 	}
-	transfer, err := tc(config.Key)
+	transfer, err := tc(s.config.Key, options, NewMaskConnWrapper(s.config.Key))
 	if err != nil {
 		return nil, fmt.Errorf("create transfer failed: %w", err)
 	}
-	s.l, err = transfer.Listen(config.Listen)
+	s.l, err = transfer.Listen(s.config.Listen)
 	if err != nil {
-		return nil, fmt.Errorf("create kcp server listener failed: %s, %w", config.Listen, err)
+		return nil, fmt.Errorf("create kcp server listener failed: %s, %w", s.config.Listen, err)
 	}
 	return &s, nil
 }
@@ -80,7 +79,7 @@ func (s *Server) Run() {
 			return
 		}
 
-		conn = &closeOnceConn{Conn: conn}
+		conn = &closeOnceServerConn{MultiplexingServerConn: conn}
 		s.connMu.Lock()
 		s.conns[conn] = struct{}{}
 		s.connMu.Unlock()
@@ -98,19 +97,13 @@ func (s *Server) Run() {
 	}
 }
 
-func (s *Server) handleConn(conn net.Conn) {
+func (s *Server) handleConn(conn MultiplexingServerConn) {
 	defer conn.Close()
 	golog.WithFields("addr", conn.RemoteAddr()).Info("new connection")
 
-	sconn, err := smux.Server(conn, smuxConfig())
-	if err != nil {
-		golog.WithFields("error", err.Error()).Error("create multiplexing conn failed")
-		return
-	}
-
 	var wg sync.WaitGroup
 	for {
-		stream, err := sconn.AcceptStream()
+		stream, err := conn.AcceptStream()
 		if err != nil {
 			if ne := net.Error(nil); errors.As(err, &ne) {
 				if ne.Temporary() {
@@ -142,6 +135,7 @@ func (s *Server) handleStream(clientConn net.Conn) {
 			clientConn.Close()
 		}
 	}()
+
 	br := bufio.NewReader(clientConn)
 	clientConn = buffedConn{clientConn, br}
 
@@ -165,15 +159,27 @@ func (s *Server) handleStream(clientConn net.Conn) {
 		}
 		return
 	}
+	golog.Debug("remote connected")
 	err = ProtocolWrite(clientConn, HandshakeResponse{
 		Status: HandshakeStatusOK,
 	})
+	golog.Debug("resp writted")
 	if err != nil {
 		golog.WithFields("error", err.Error()).Error("write handshake response failed")
 		proxyConn.Close()
 		return
 	}
 
+	{
+		cConn, err := newCompressConn(clientConn, s.config.Compress)
+		if err != nil {
+			clientConn.Close()
+			golog.WithFields("error", err.Error()).Errorf("create compress conn failed")
+			return
+		}
+		clientConn = cConn
+	}
 	proxyStarted = true
+	golog.Debug("start pipe")
 	pipeConns(clientConn, proxyConn)
 }
