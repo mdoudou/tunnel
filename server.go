@@ -117,7 +117,6 @@ func (s *Server) handleConn(conn MultiplexingServerConn) {
 			break
 		}
 
-		golog.Debug("new stream")
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -137,7 +136,7 @@ func (s *Server) handleStream(clientConn net.Conn) {
 	}()
 
 	br := bufio.NewReader(clientConn)
-	clientConn = buffedConn{clientConn, br}
+	clientConn = buffReadConn{clientConn, br}
 
 	var handshakeReq HandshakeRequest
 	err := ProtocolRead(br, &handshakeReq)
@@ -159,11 +158,9 @@ func (s *Server) handleStream(clientConn net.Conn) {
 		}
 		return
 	}
-	golog.Debug("remote connected")
 	err = ProtocolWrite(clientConn, HandshakeResponse{
 		Status: HandshakeStatusOK,
 	})
-	golog.Debug("resp writted")
 	if err != nil {
 		golog.WithFields("error", err.Error()).Error("write handshake response failed")
 		proxyConn.Close()
@@ -180,6 +177,5 @@ func (s *Server) handleStream(clientConn net.Conn) {
 		clientConn = cConn
 	}
 	proxyStarted = true
-	golog.Debug("start pipe")
 	pipeConns(clientConn, proxyConn)
 }

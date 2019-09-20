@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -145,5 +146,11 @@ func TestMask(t *testing.T) {
 
 	if !bytes.Equal(buf, []byte("test")) {
 		t.Fatal("unmask failed")
+	}
+}
+
+func TestHttpMatcher(t *testing.T) {
+	for _, m := range httpMethods {
+		t.Log(protocolHttpMatcher(strings.NewReader(m)))
 	}
 }

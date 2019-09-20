@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -298,15 +299,26 @@ func (c *quicConn) NumStreams() int {
 func (c *quicConn) OpenStream() (net.Conn, error) {
 	s, err := c.Session.OpenStream()
 	if err != nil {
-		return nil, err
+		if s == nil || !c.isNoError(err) {
+			return nil, err
+		}
 	}
 	return newQuicStream(c, s), nil
+}
+
+func (c *quicConn) isNoError(err error) bool {
+	if ec := quic.ErrorCode(0); errors.As(err, &ec) {
+		return ec == 0
+	}
+	return false
 }
 
 func (c *quicConn) AcceptStream() (net.Conn, error) {
 	s, err := c.Session.AcceptStream(context.Background())
 	if err != nil {
-		return nil, err
+		if s == nil || !c.isNoError(err) {
+			return nil, err
+		}
 	}
 	return newQuicStream(c, s), nil
 }

@@ -67,12 +67,12 @@ func quicConfig() *quic.Config {
 	}
 }
 
-type buffedConn struct {
+type buffReadConn struct {
 	net.Conn
 	br *bufio.Reader
 }
 
-func (s buffedConn) Read(b []byte) (int, error) {
+func (s buffReadConn) Read(b []byte) (int, error) {
 	var buffed int
 	if s.br != nil {
 		buffed = s.br.Buffered()
@@ -620,4 +620,59 @@ func (m *MaskPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	n, err := m.PacketConn.WriteTo(b, addr)
 	m.m.Unmask(b[n:])
 	return n, err
+}
+
+type connListener struct {
+	conn net.Conn
+}
+
+func (c *connListener) Close() error {
+	return nil
+}
+
+func (c *connListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}
+}
+
+func (c *connListener) Accept() (net.Conn, error) {
+	conn := c.conn
+	if conn != nil {
+		c.conn = nil
+		return conn, nil
+	}
+	return nil, fmt.Errorf("closed")
+}
+
+func protocolHttpMatcher(r io.Reader) bool {
+	br := bufio.NewReader(r)
+	var i int
+	for {
+		b, err := br.ReadByte()
+		if err == io.EOF || b == ' ' {
+			break
+		}
+		if err != nil {
+			return false
+		}
+		var (
+			hasMatched bool
+			hasNext    bool
+		)
+		for _, m := range httpMethods {
+			if i < len(m) {
+				hasNext = hasNext || i < len(m)-1
+				if m[i] == b {
+					hasMatched = true
+				}
+			}
+		}
+		if !hasMatched {
+			return false
+		}
+		if !hasNext {
+			break
+		}
+		i++
+	}
+	return i >= 3
 }

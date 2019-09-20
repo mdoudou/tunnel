@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"net/http"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/cosiner/golog"
 	"github.com/ginuerzh/gosocks5"
 	"github.com/oschwald/geoip2-golang"
+	"github.com/soheilhy/cmux"
 )
 
 type proxyRule struct {
@@ -29,7 +32,7 @@ type Client struct {
 	geoip       *geoip2.Reader
 
 	closed         uint32
-	clientListener net.Listener
+	clientListener *groupListener
 
 	serverTransfer Transfer
 	serverConnMu   sync.RWMutex
@@ -48,10 +51,11 @@ func NewClient(config ClientConfig) (*Client, error) {
 		serverConns:  make(map[MultiplexingClientConn]int),
 	}
 	var err error
-	c.clientListener, err = net.Listen("tcp", c.config.Listen)
+	l, err := net.Listen("tcp", c.config.Listen)
 	if err != nil {
 		return nil, fmt.Errorf("create listener failed: %w", err)
 	}
+	c.clientListener = newGroupListener(l)
 	transfer, options := parseTransfer(config.Server.Transfer)
 	tc, ok := transfers[transfer]
 	if !ok {
@@ -126,9 +130,89 @@ func (c *Client) Close() {
 	c.clientConnWg.Wait()
 }
 
+type acceptResult struct {
+	Type string
+	Conn net.Conn
+
+	Err error
+}
+
+type groupListener struct {
+	l net.Listener
+
+	c      chan acceptResult
+	close  chan struct{}
+	closed bool
+}
+
+func newGroupListener(l net.Listener) *groupListener {
+	g := groupListener{
+		l:     l,
+		c:     make(chan acceptResult, 2),
+		close: make(chan struct{}),
+	}
+	g.run()
+	return &g
+}
+
+func (t groupListener) Close() {
+	t.closed = true
+	close(t.close)
+	t.l.Close()
+}
+
+var httpMethods = []string{
+	http.MethodGet,
+	http.MethodHead,
+	http.MethodPost,
+	http.MethodPut,
+	http.MethodPatch,
+	http.MethodDelete,
+	http.MethodConnect,
+	http.MethodOptions,
+	http.MethodTrace,
+}
+
+func (t groupListener) run() {
+	l := cmux.New(t.l)
+	for typ, l := range map[string]net.Listener{
+		"http":   l.Match(protocolHttpMatcher),
+		"socks5": l.Match(cmux.Any()),
+	} {
+		typ := typ
+		l := l
+		go func() {
+			for {
+				conn, err := l.Accept()
+				if t.closed {
+					break
+				}
+				t.c <- acceptResult{
+					Conn: conn,
+					Err:  err,
+					Type: typ,
+				}
+			}
+		}()
+	}
+	go l.Serve()
+}
+
+func (t groupListener) Accept() (acceptResult, error) {
+	if t.closed {
+		return acceptResult{}, fmt.Errorf("listener closed")
+	}
+	select {
+	case res := <-t.c:
+		return res, res.Err
+	case <-t.close:
+		return acceptResult{}, fmt.Errorf("listener closed")
+	}
+}
+
 func (c *Client) Run() {
 	for {
-		conn, err := c.clientListener.Accept()
+		res, err := c.clientListener.Accept()
 		if err != nil {
 			if ne := net.Error(nil); errors.As(err, &ne) {
 				if ne.Temporary() {
@@ -143,7 +227,7 @@ func (c *Client) Run() {
 		}
 
 		c.clientConnMu.Lock()
-		conn = &closeOnceConn{Conn: conn}
+		conn := net.Conn(&closeOnceConn{Conn: res.Conn})
 		c.clientConns[conn] = struct{}{}
 		c.clientConnMu.Unlock()
 		c.clientConnWg.Add(1)
@@ -155,7 +239,7 @@ func (c *Client) Run() {
 				c.clientConnMu.Unlock()
 			}()
 
-			c.handleConn(conn)
+			c.handleConn(conn, res.Type)
 		}()
 	}
 }
@@ -275,7 +359,7 @@ func (c *Client) createServerProxyStream(addr string) (net.Conn, error) {
 		return nil, err
 	}
 	br := bufio.NewReader(conn)
-	conn = buffedConn{Conn: conn, br: br}
+	conn = buffReadConn{Conn: conn, br: br}
 
 	err = ProtocolWrite(conn, HandshakeRequest{Addr: addr})
 	if err != nil {
@@ -380,14 +464,40 @@ func (c *Client) shouldProxy(addr *gosocks5.Addr) (bool, error) {
 	return c.shouldProxyByGeoIP(ips), nil
 }
 
-func (c *Client) handleConn(clientConn net.Conn) {
+func (c *Client) connectToRemote(addr *gosocks5.Addr) (net.Conn, bool) {
+	proxy, err := c.shouldProxy(addr)
+	if err != nil {
+		golog.WithFields("error", err.Error(), "addr", addr.String()).Error("check addr should proxy failed")
+		proxy = true
+	}
+
+	var proxyConn net.Conn
+	if proxy {
+		golog.WithFields("addr", addr.String()).Debug("start proxy")
+		proxyConn, err = c.createServerProxyStream(addr.String())
+		if err != nil {
+			golog.WithFields("error", err).Error("create server proxy conn failed")
+			return nil, false
+		}
+		golog.WithFields("addr", addr.String()).Debug("server proxy created")
+	} else {
+		golog.WithFields("addr", addr.String()).Debug("start direct")
+		proxyConn, err = net.DialTimeout("tcp", addr.String(), time.Second*6)
+		if err != nil {
+			golog.WithFields("error", err).Error("dial addr failed")
+			return nil, false
+		}
+	}
+	return proxyConn, true
+}
+
+func (c *Client) handleSocks5(clientConn net.Conn) {
 	var proxyStarted bool
 	defer func() {
 		if !proxyStarted {
 			clientConn.Close()
 		}
 	}()
-
 	{
 		sconn := gosocks5.ServerConn(clientConn, nil)
 		err := sconn.Handleshake()
@@ -419,40 +529,104 @@ func (c *Client) handleConn(clientConn net.Conn) {
 		writeReply(gosocks5.CmdUnsupported)
 		return
 	}
+	proxyConn, ok := c.connectToRemote(req.Addr)
+	if !ok {
+		return
+	}
+
+	var replyWrited bool
 	defer func() {
-		if !proxyStarted {
+		if !replyWrited {
 			writeReply(gosocks5.Failure)
 		}
 	}()
-	proxy, err := c.shouldProxy(req.Addr)
-	if err != nil {
-		golog.WithFields("error", err.Error(), "addr", req.Addr.String()).Error("check addr should proxy failed")
-		proxy = true
+
+	replyWrited = true
+	if !writeReply(gosocks5.Succeeded) {
+		proxyConn.Close()
+		return
 	}
 
-	var proxyConn net.Conn
-	if proxy {
-		golog.WithFields("addr", req.Addr.String()).Debug("start proxy")
-		proxyConn, err = c.createServerProxyStream(req.Addr.String())
-		if err != nil {
-			golog.WithFields("error", err).Error("create server proxy conn failed")
+	proxyStarted = true
+	pipeConns(clientConn, proxyConn)
+}
+
+func (c *Client) handleHttp(clientConn net.Conn) {
+	var proxyStarted bool
+	defer func() {
+		if !proxyStarted {
+			clientConn.Close()
+		}
+	}()
+
+	br := bufio.NewReader(clientConn)
+	req, err := http.ReadRequest(br)
+	if err != nil {
+		golog.WithFields("error", err.Error()).Errorf("read request failed")
+		return
+	}
+	writeResp := func(statusCode int, statusText string) {
+		resp := http.Response{
+			StatusCode: statusCode,
+			Status:     statusText,
+			Proto:      req.Proto,
+			ProtoMajor: req.ProtoMajor,
+			ProtoMinor: req.ProtoMinor,
+			Header:     make(http.Header),
+			Close:      true,
+		}
+		resp.Write(clientConn)
+	}
+
+	host := req.Host
+	if !strings.Contains(host, ":") {
+		if req.URL.Scheme == "http" {
+			host += ":80"
+		} else if req.URL.Scheme == "https" {
+			host += ":443"
+		} else {
+			writeResp(http.StatusBadRequest, "Bad Request")
 			return
 		}
-		golog.WithFields("addr", req.Addr.String()).Debug("server proxy created")
+	}
+	addr, err := gosocks5.NewAddr(host)
+	if err != nil {
+		golog.WithFields("error", err.Error()).Error("parse request host failed")
+		return
+	}
+
+	proxyConn, ok := c.connectToRemote(addr)
+	if !ok {
+		writeResp(http.StatusServiceUnavailable, "Service unavailable")
+		return
+	}
+	defer func() {
+		if !proxyStarted {
+			proxyConn.Close()
+		}
+	}()
+	if req.Method == http.MethodConnect {
+		writeResp(http.StatusOK, "Connection established")
 	} else {
-		golog.WithFields("addr", req.Addr.String()).Debug("start direct")
-		proxyConn, err = net.DialTimeout("tcp", req.Addr.String(), time.Second*6)
+		err = req.Write(proxyConn)
 		if err != nil {
-			golog.WithFields("error", err).Error("dial addr failed")
+			golog.WithFields("error", err.Error()).Error("write request to proxy conn failed")
+			writeResp(http.StatusBadGateway, "Bad Gateway")
 			return
 		}
 	}
 
 	proxyStarted = true
-	if !writeReply(gosocks5.Succeeded) {
-		proxyConn.Close()
+	pipeConns(buffReadConn{Conn: clientConn, br: br}, proxyConn)
+}
+
+func (c *Client) handleConn(clientConn net.Conn, typ string) {
+	switch typ {
+	case "socks5":
+		c.handleSocks5(clientConn)
+	case "http":
+		c.handleHttp(clientConn)
+	default:
 		clientConn.Close()
-		return
 	}
-	pipeConns(clientConn, proxyConn)
 }
