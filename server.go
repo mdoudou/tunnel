@@ -135,6 +135,15 @@ func (s *Server) handleStream(clientConn net.Conn) {
 		}
 	}()
 
+	{
+		cConn, err := newCompressConn(clientConn, s.config.Compress)
+		if err != nil {
+			clientConn.Close()
+			golog.WithFields("error", err.Error()).Errorf("create compress conn failed")
+			return
+		}
+		clientConn = cConn
+	}
 	br := bufio.NewReader(clientConn)
 	clientConn = buffReadConn{clientConn, br}
 
@@ -167,15 +176,6 @@ func (s *Server) handleStream(clientConn net.Conn) {
 		return
 	}
 
-	{
-		cConn, err := newCompressConn(clientConn, s.config.Compress)
-		if err != nil {
-			clientConn.Close()
-			golog.WithFields("error", err.Error()).Errorf("create compress conn failed")
-			return
-		}
-		clientConn = cConn
-	}
 	proxyStarted = true
 	pipeConns(clientConn, proxyConn)
 }

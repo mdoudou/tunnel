@@ -41,6 +41,7 @@ type TransferCreator func(key string, options map[string]string, w *MaskConnWrap
 var transfers = map[string]TransferCreator{
 	"kcp":  NewKcp,
 	"quic": NewQUIC,
+	"tcp":  NewTcp,
 }
 
 type MultiplexingConn interface {
@@ -248,6 +249,61 @@ func (q *Quic) Listen(addr string) (MultiplexingListener, error) {
 	}, nil
 }
 
+type Tcp struct {
+	w         *MaskConnWrapper
+	serverTLS *tls.Config
+	clientTLS *tls.Config
+
+	smuxConfig *smux.Config
+}
+
+func NewTcp(key string, options map[string]string, w *MaskConnWrapper) (Transfer, error) {
+	t := Tcp{
+		w: w,
+	}
+	var err error
+	t.serverTLS, err = generateTLSFromKey(key, true)
+	if err != nil {
+		return nil, fmt.Errorf("generate tls config failed: %w", err)
+	}
+	t.clientTLS, err = generateTLSFromKey(key, false)
+	if err != nil {
+		return nil, fmt.Errorf("generate tls config failed: %w", err)
+	}
+	t.smuxConfig = smuxConfig()
+	return &t, nil
+}
+
+func (t *Tcp) Dial(addr string) (MultiplexingClientConn, error) {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	if t.w != nil {
+		conn = t.w.WrapConn(conn)
+	}
+	conn = tls.Client(conn, t.clientTLS)
+	c, err := newSmuxClientConn(conn, t.smuxConfig)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
+func (t *Tcp) Listen(addr string) (MultiplexingListener, error) {
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	w := listenerWrapper{Listener: l}
+	if t.w != nil {
+		w.Wrappers = append(w.Wrappers, t.w.WrapConn)
+	}
+	l = tls.NewListener(w, t.serverTLS)
+	return smuxListener{config: t.smuxConfig, Listener: l}, nil
+}
+
 type quicConn struct {
 	quic.Session
 
@@ -389,6 +445,29 @@ func (s smuxListener) Accept() (MultiplexingServerConn, error) {
 		return nil, err
 	}
 	return sconn, nil
+}
+
+type connWrappers []func(conn net.Conn) net.Conn
+
+type listenerWrapper struct {
+	net.Listener
+
+	Wrappers connWrappers
+}
+
+func (s connWrappers) Wrap(conn net.Conn) net.Conn {
+	for _, w := range s {
+		conn = w(conn)
+	}
+	return conn
+}
+
+func (s listenerWrapper) Accept() (net.Conn, error) {
+	conn, err := s.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return s.Wrappers.Wrap(conn), nil
 }
 
 func generateTLSFromKey(keyStr string, isServer bool) (*tls.Config, error) {
