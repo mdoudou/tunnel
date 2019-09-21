@@ -1,0 +1,22 @@
+server:
+  compress: s2 # disable, zlib, gzip, s2, snappy
+  transfer: kcp # kcp, quic, tcp
+  listen: :1099
+  key: 'test key'
+
+client:
+  listen: :1099
+  server:
+    compress: s2 # disable, zlib, gzip, s2, snappy
+    transfer: kcp # kcp, quic, tcp
+    listen: localhost:1099
+    key: 'test key'
+  rules: # if no rules matched, proxy by default
+    direct: [] # regexp rules need proxy, support dns name and ip address
+    proxy: [] #  regexp rules without proxy
+  geoip: # leave 'file' empty and 'autoDownload' false to disable
+    file: '' # local file
+    autoDownload: true # auto download Country-Lite db from geolite.maxmind.com to user temporary directory,
+                       # the file size is about 3.8M
+    nameLang: '' # country name language, default zh-CN
+    directCountries : [] # countries without proxy, default [中国]
