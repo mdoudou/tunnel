@@ -80,5 +80,5 @@ func main() {
 
 		handler.Run()
 	}()
-	osSig.Wait()
+	osSig.Loop()
 }
