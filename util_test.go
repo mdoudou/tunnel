@@ -75,7 +75,7 @@ func TestCompress(t *testing.T) {
 }
 
 func TestKeyReader(t *testing.T) {
-	r := newKeyReader("test")
+	r := newCycledKeyReader(hashKeyForRandReader("test"))
 	_, err := rsa.GenerateKey(r, 2048)
 	if err != nil {
 		t.Fatal(err)

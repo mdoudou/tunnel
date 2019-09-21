@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -349,13 +350,13 @@ func parseTransfer(t string) (string, map[string]string) {
 	return t, options
 }
 
-type keyReader struct {
+type cycledKeyReader struct {
 	s   []byte
 	l   int
 	idx int
 }
 
-func newKeyReader(k string) *keyReader {
+func hashKeyForRandReader(k string) []byte {
 	var buf bytes.Buffer
 	data := []byte(k)
 	for i := 0; i < 512; i++ {
@@ -364,18 +365,21 @@ func newKeyReader(k string) *keyReader {
 		data = h.Sum(nil)
 		buf.Write(data)
 	}
+	return buf.Bytes()
+}
 
-	return &keyReader{
-		s: buf.Bytes(),
-		l: buf.Len(),
+func newCycledKeyReader(key []byte) *cycledKeyReader {
+	return &cycledKeyReader{
+		s: key,
+		l: len(key),
 	}
 }
 
-func (k *keyReader) Reset() {
+func (k *cycledKeyReader) Reset() {
 	k.idx = 0
 }
 
-func (k *keyReader) Read(b []byte) (int, error) {
+func (k *cycledKeyReader) Read(b []byte) (int, error) {
 	if k.l <= 0 {
 		return 0, io.EOF
 	}
@@ -396,7 +400,7 @@ func (k *keyReader) Read(b []byte) (int, error) {
 }
 
 func generateCAKey(keyStr string, bits int) (string, *rsa.PrivateKey, error) {
-	r := newKeyReader(keyStr)
+	r := newCycledKeyReader(hashKeyForRandReader(keyStr))
 	keys := make(map[string]*rsa.PrivateKey)
 	const NPrimes = 2
 
@@ -471,12 +475,17 @@ func NewMaskConnWrapper(key string) *MaskConnWrapper {
 	h.Write([]byte(key))
 	d := h.Sum(nil)
 
+	r := newCycledKeyReader(d)
 	xor := NewXorMasker(d)
 	maskers := Maskers{
 		xor,
 		ReverseMasker{},
-		NewDictMasker(d),
+		NewDictMasker(r),
 	}
+
+	rand.New(rand.NewSource(int64(xor)<<8|int64(xor))).Shuffle(len(maskers), func(i, j int) {
+		maskers[i], maskers[j] = maskers[j], maskers[i]
+	})
 	return &MaskConnWrapper{
 		Masker: maskers,
 	}
@@ -552,12 +561,11 @@ type DictMasker struct {
 	dictRestore [256]byte
 }
 
-func NewDictMasker(key []byte) *DictMasker {
+func NewDictMasker(r *cycledKeyReader) *DictMasker {
 	var m DictMasker
 	for i := range m.dict {
 		m.dict[i] = byte(i)
 	}
-	r := keyReader{s: key, l: len(key)}
 
 	var buf [1]byte
 	for i := range m.dict {
