@@ -80,5 +80,8 @@ func main() {
 
 		handler.Run()
 	}()
-	osSig.Loop()
+	sig := osSig.Loop()
+	if sig != nil {
+		golog.WithFields("signal", sig.String()).Error("existed by signal")
+	}
 }
