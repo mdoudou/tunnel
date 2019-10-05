@@ -684,3 +684,25 @@ func protocolHttpMatcher(r io.Reader) bool {
 	}
 	return i >= 3
 }
+
+var localIpnets []*net.IPNet
+
+func init() {
+	cidrs := []string{"192.168.0.0/16", "172.16.0.0/12", "10.0.0.0/8"}
+	for _, n := range cidrs {
+		_, ipnet, err := net.ParseCIDR(n)
+		if err != nil {
+			panic(fmt.Errorf("parse lan ip nets failed: %s, %w", n, err))
+		}
+		localIpnets = append(localIpnets, ipnet)
+	}
+}
+
+func isLocalIpNet(ip net.IP) bool {
+	for _, n := range localIpnets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}

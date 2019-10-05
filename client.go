@@ -366,7 +366,7 @@ func (c *Client) createServerProxyStream(addr string) (net.Conn, error) {
 		}
 		conn = cConn
 	}
-	
+
 	br := bufio.NewReader(conn)
 	conn = buffReadConn{Conn: conn, br: br}
 
@@ -386,7 +386,7 @@ func (c *Client) createServerProxyStream(addr string) (net.Conn, error) {
 	default:
 		return nil, fmt.Errorf("server proxy addr failed: %s", handshakeResp.Msg)
 	}
-	
+
 	return conn, nil
 }
 
@@ -463,6 +463,11 @@ func (c *Client) shouldProxy(addr *gosocks5.Addr) (bool, error) {
 	if err != nil {
 		return false, nil
 	}
+	for _, ip := range ips {
+		if isLocalIpNet(ip) {
+			return false, nil
+		}
+	}
 	return c.shouldProxyByGeoIP(ips), nil
 }
 
@@ -486,7 +491,7 @@ func (c *Client) connectToRemote(addr *gosocks5.Addr) (net.Conn, bool) {
 		golog.WithFields("addr", addr.String()).Debug("start direct")
 		proxyConn, err = net.DialTimeout("tcp", addr.String(), time.Second*6)
 		if err != nil {
-			golog.WithFields("error", err).Error("dial addr failed")
+			golog.WithFields("error", err, "addr", addr.String()).Error("dial addr failed")
 			return nil, false
 		}
 	}
