@@ -84,9 +84,9 @@ func NewClient(config ClientConfig) (*Client, error) {
 			}
 		}
 	}
-	c.regexpRules = make([]proxyRule, 0, len(c.config.Rules.Direct)+len(c.config.Rules.Proxy))
-	for i, rs := range [][]string{c.config.Rules.Direct, c.config.Rules.Proxy} {
-		proxy := i > 0
+	c.regexpRules = make([]proxyRule, 0, len(c.config.Rules.Proxy)+len(c.config.Rules.Direct))
+	for i, rs := range [][]string{c.config.Rules.Proxy, c.config.Rules.Direct} {
+		proxy := i == 0
 		for _, r := range rs {
 			reg, err := regexp.Compile(r)
 			if err != nil {
