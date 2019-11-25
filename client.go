@@ -296,15 +296,6 @@ func (c *Client) incrServerConnFailTimes(conn MultiplexingClientConn) {
 	}
 }
 
-func (c *Client) clearServerConnFailTimes(conn MultiplexingClientConn) {
-	c.serverConnMu.Lock()
-	defer c.serverConnMu.Unlock()
-	_, has := c.serverConns[conn]
-	if has {
-		c.serverConns[conn] = 0
-	}
-}
-
 type clientProxyConn struct {
 	net.Conn
 
@@ -339,7 +330,6 @@ func (c *Client) openServerStream() (net.Conn, error) {
 			golog.WithFields("error", err.Error()).Error("open server stream failed")
 			continue
 		}
-		c.clearServerConnFailTimes(conn)
 		return &clientProxyConn{
 			Conn:  stream,
 			sconn: conn,

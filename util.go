@@ -56,14 +56,14 @@ func (c *closeOnceServerConn) Close() error {
 
 func smuxConfig() *smux.Config {
 	config := smux.DefaultConfig()
-	config.KeepAliveTimeout = time.Minute * 5
+	config.KeepAliveTimeout = time.Minute * 3
 	return config
 }
 
 func quicConfig() *quic.Config {
 	return &quic.Config{
 		//HandshakeTimeout: time.Second * 3,
-		IdleTimeout: time.Minute * 5,
+		IdleTimeout: time.Minute * 3,
 		KeepAlive:   true,
 	}
 }
@@ -135,7 +135,7 @@ func initGolog(debug bool) {
 	} else {
 		var err error
 		writer, err = golog.SingleFile(golog.FileLogOptions{
-			ExpireDays: 7,
+			ExpireDays: 3,
 			LogDir:     "logs",
 		})
 		if err != nil {
